@@ -1,0 +1,467 @@
+---
+title: "Project NYPD"
+author: "Primal Patel"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                       fig.width = 8, fig.height = 5)
+options(tigris_use_cache = TRUE)
+```
+
+# NYPD Shootings Data (Historic)
+
+Although it has been archived, this NYPD shootings data set has been collated by the Office of Management Analysis and Planning from 2006 to 2024, manually extracted per quarter, from the website: <https://catalog.data.gov/dataset/archived_nypd-shooting-incident-data-historic?from_hint=eyJxIjoiTllQRCBTaG9vdGluZyBJbmNpZGVudCBEYXRhIiwic29ydCI6InJlbGV2YW5jZSJ9>, accessed 06/08-2026.
+
+*NOTE: This NYPD Shooting Incident dataset **was replaced with three related datasets** – for shootings, shooting victims, and shooting offenders. The new structure should be clearer and easier to use, especially for shootings with multiple victims or multiple offenders. Please follow this link for the most current available information. List of every shooting incident that occurred in NYC going back to 2006 through the end of the previous calendar year. This is a breakdown of every shooting incident that occurred in NYC going back to 2006 through the end of the previous calendar year. This data is manually extracted every quarter and reviewed by the Office of Management Analysis and Planning before being posted on the NYPD website. Each record represents a shooting incident in NYC and includes information about the event, the location and time of occurrence. In addition, information related to suspect and victim demographics is also included. This data can be used by the public to **explore the nature of shooting/criminal activity**. Please refer to the attached data footnotes for additional information about this dataset.*
+
+The purpose of this document is to explore the "nature of shooting/criminal activity" in the provided dataset. Firstly, the data set is imported and checked for duplicate records. It is then cleaned so that every categorical field is properly represented as a factor, missing/invalid category values are consistently mapped to `UNKNOWN`, and missing coordinates are imputed. The cleaned data is then used to answer a series of descriptive questions about the "who, where, and when" of these incidents.
+
+# Data Import and Duplicate Checks
+
+```{r load_data, echo = TRUE}
+library(tidyverse)
+library(lubridate)
+library(skimr)
+library(hms)
+library(ggalluvial)
+library(sf)
+library(tigris)
+library(scales)
+
+nyc_data <- read_csv(
+  "https://data.cityofnewyork.us/api/v3/views/833y-fsy8/export.csv?accessType=DOWNLOAD",
+  show_col_types = FALSE
+)
+```
+
+Number of fully duplicated rows is `r sum(duplicated(nyc_data))`.
+
+```{r check_further_dupes, echo = TRUE}
+n_duplicate_keys <- sum(duplicated(nyc_data$INCIDENT_KEY))
+n_distinct_keys  <- n_distinct(nyc_data$INCIDENT_KEY)
+
+dup_keys <- nyc_data |>
+  count(INCIDENT_KEY) |>
+  filter(n > 1)
+
+# Example: one INCIDENT_KEY, multiple victim rows
+nyc_data |>
+  filter(INCIDENT_KEY == dup_keys$INCIDENT_KEY[1]) |>
+  select(INCIDENT_KEY, OCCUR_DATE, OCCUR_TIME, VIC_AGE_GROUP, VIC_SEX, VIC_RACE)
+```
+
+There are no fully duplicated rows, but `r n_duplicate_keys` `INCIDENT_KEY` values are repeated across `r n_distinct_keys` distinct incidents (`r nrow(nyc_data)` rows total). These are incidents with multiple victims: each row represents one victim within an incident, not one incident overall, so a single shooting event can contribute more than one row to the data.
+
+```{r glimpse_raw, echo = TRUE}
+glimpse(nyc_data)
+```
+
+# Data Cleaning and Factor Conversion
+
+```{r skim_raw}
+# skim_without_charts() (rather than skim()) is used because skimr's
+# inline unicode sparkline histograms don't render under pdflatex.
+skim_without_charts(nyc_data)
+```
+
+The raw data has several issues that need to be resolved before analysis: dates and times are stored as text, `STATISTICAL_MURDER_FLAG` is logical rather than categorical, several demographic columns mix real category labels with `"(null)"` strings, blanks, and a handful of malformed entries (e.g. stray four-digit numbers in the age-group columns), and 97 rows are missing latitude/longitude. The chunk below does further cleaning. 
+
+```{r clean_data, echo = TRUE}
+valid_age_groups <- c("<18", "18-24", "25-44", "45-64", "65+")
+
+# Treat blanks and the literal string "(null)" as missing.
+blank_to_na <- function(x) {
+  x <- na_if(as.character(x), "")
+  na_if(x, "(null)")
+}
+
+# Collapse missing/invalid values down to a single "UNKNOWN" category.
+# If `valid` is supplied, any value not in that set (including data-entry
+# errors like a stray "1028" in an age-group column) is also folded in.
+to_unknown <- function(x, valid = NULL) {
+  x <- blank_to_na(x)
+  x <- na_if(x, "NONE")
+  if (!is.null(valid)) x[!(x %in% valid)] <- NA
+  replace_na(x, "UNKNOWN")
+}
+
+nyc_data <- nyc_data |>
+  mutate(
+    OCCUR_DATE = mdy(OCCUR_DATE),
+    # sub() (rather than substr()) because OCCUR_TIME is not always
+    # zero-padded (e.g. "2:53:00"), which would otherwise misparse the hour.
+    OCCUR_HOUR = as.integer(sub(":.*", "", OCCUR_TIME)),
+    OCCUR_TIME = hms::as_hms(OCCUR_TIME),
+    OCCUR_YEAR = year(OCCUR_DATE),
+
+    # Murder flag: logical -> factor
+    STATISTICAL_MURDER_FLAG = factor(STATISTICAL_MURDER_FLAG,
+                                      levels = c(FALSE, TRUE),
+                                      labels = c("Non-Fatal", "Fatal")),
+
+    # Perpetrator fields: (null)/blank/NA -> UNKNOWN, invalid ages -> UNKNOWN
+    PERP_AGE_GROUP = factor(to_unknown(PERP_AGE_GROUP, valid_age_groups),
+                             levels = c(valid_age_groups, "UNKNOWN")),
+    PERP_SEX       = factor(to_unknown(na_if(PERP_SEX, "U")),
+                             levels = c("M", "F", "UNKNOWN")),
+    PERP_RACE      = factor(to_unknown(PERP_RACE)),
+
+    # Victim fields
+    VIC_AGE_GROUP = factor(to_unknown(VIC_AGE_GROUP, valid_age_groups),
+                            levels = c(valid_age_groups, "UNKNOWN")),
+    # VIC_SEX: "U" is a legitimate "unknown" reported by NYPD, kept as its
+    # own level (unlike PERP_SEX it is not collapsed into UNKNOWN because
+    # relatively few victim records use it and it is worth tracking on its own).
+    VIC_SEX  = factor(VIC_SEX, levels = c("M", "F", "U"),
+                       labels = c("M", "F", "U (Unknown)")),
+    VIC_RACE = factor(to_unknown(VIC_RACE)),
+
+    # Location / borough
+    LOCATION_DESC      = factor(to_unknown(LOCATION_DESC)),
+    LOC_OF_OCCUR_DESC  = factor(blank_to_na(LOC_OF_OCCUR_DESC)),
+    LOC_CLASSFCTN_DESC = factor(blank_to_na(LOC_CLASSFCTN_DESC)),
+    BORO               = factor(BORO),
+
+    # Derived flag: was the perpetrator entirely unidentified (age, sex,
+    # and race all unknown)? Used below to look at under/misreporting.
+    PERP_UNKNOWN = PERP_AGE_GROUP == "UNKNOWN" &
+                   PERP_SEX == "UNKNOWN" &
+                   PERP_RACE == "UNKNOWN"
+  ) |>
+  select(-JURISDICTION_CODE, -Lon_Lat, -X_COORD_CD, -Y_COORD_CD)
+
+# Impute missing coordinates with the mean coordinates for that borough.
+boro_coords <- nyc_data |>
+  group_by(BORO) |>
+  summarise(mean_lat = mean(Latitude, na.rm = TRUE),
+            mean_lon = mean(Longitude, na.rm = TRUE),
+            .groups = "drop")
+
+nyc_data <- nyc_data |>
+  left_join(boro_coords, by = "BORO") |>
+  mutate(
+    Latitude  = if_else(is.na(Latitude), mean_lat, Latitude),
+    Longitude = if_else(is.na(Longitude), mean_lon, Longitude)
+  ) |>
+  select(-mean_lat, -mean_lon)
+
+glimpse(nyc_data)
+```
+
+# Who: Demographics and Race
+
+## Perpetrator race to victim race
+
+This alluvial diagram traces incidents from perpetrator race to victim race, restricted to incidents with an identified perpetrator (unidentified perpetrators are covered separately below, since folding them in here would dominate the diagram).
+
+```{r sankey-race}
+race_flow <- nyc_data |>
+  filter(PERP_RACE != "UNKNOWN") |>
+  count(PERP_RACE, VIC_RACE)
+
+ggplot(race_flow, aes(axis1 = PERP_RACE, axis2 = VIC_RACE, y = n)) +
+  geom_alluvium(aes(fill = PERP_RACE)) +
+  geom_stratum(width = 1/4, fill = "grey90", color = "grey40") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 2.6) +
+  scale_x_discrete(limits = c("Perpetrator Race", "Victim Race"), expand = c(.15, .15)) +
+  labs(title = "Perpetrator race to victim race (identified perpetrators only)", y = "Incidents") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Is the perpetrator-victim relationship correlated with race?
+
+The heatmap below row-normalizes the same data: for a given perpetrator race, what share of their victims came from each race group?
+
+```{r race-relationship-heatmap}
+race_pct <- nyc_data |>
+  filter(PERP_RACE != "UNKNOWN", VIC_RACE != "UNKNOWN") |>
+  count(PERP_RACE, VIC_RACE) |>
+  group_by(PERP_RACE) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup()
+
+ggplot(race_pct, aes(x = VIC_RACE, y = PERP_RACE, fill = pct)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = percent, name = "Share of\nperpetrator's\nincidents") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Victim race by perpetrator race (row-normalized)",
+       x = "Victim race", y = "Perpetrator race")
+
+pct_same_race <- nyc_data |>
+  filter(PERP_RACE != "UNKNOWN", VIC_RACE != "UNKNOWN") |>
+  summarise(pct = mean(PERP_RACE == VIC_RACE)) |>
+  pull(pct)
+```
+
+Among incidents with an identified perpetrator and victim, `r percent(pct_same_race, accuracy = 0.1)` involve a perpetrator and victim of the same race, indicating that these shootings are overwhelmingly intra-racial rather than inter-racial.
+
+## Do men shoot more at men than at women?
+
+```{r perp-vic-sex}
+sex_flow <- nyc_data |>
+  filter(PERP_SEX != "UNKNOWN") |>
+  count(PERP_SEX, VIC_SEX) |>
+  group_by(PERP_SEX) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup()
+
+ggplot(sex_flow, aes(x = PERP_SEX, y = pct, fill = VIC_SEX)) +
+  geom_col(position = "stack") +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Victim sex by perpetrator sex (identified perpetrators only)",
+       x = "Perpetrator sex", y = "Share of victims", fill = "Victim sex") +
+  theme_minimal()
+
+pct_male_on_male <- nyc_data |>
+  filter(PERP_SEX == "M") |>
+  summarise(pct = mean(VIC_SEX == "M")) |>
+  pull(pct)
+```
+
+`r percent(pct_male_on_male, accuracy = 0.1)` of shootings by a male perpetrator have a male victim, confirming that male-on-male shootings dominate even after accounting for the overall skew of the data toward male victims.
+
+## Unidentified perpetrators: a proxy for under- and misreporting
+
+Incidents where the perpetrator's age, sex, and race are all unknown are effectively unsolved. Their rate is not evenly distributed by borough, which is worth flagging as a source of reporting bias when interpreting any perpetrator-demographic result above.
+
+```{r unknown-by-boro}
+nyc_data |>
+  group_by(BORO) |>
+  summarise(pct_perp_unknown = mean(PERP_UNKNOWN)) |>
+  ggplot(aes(x = fct_reorder(BORO, pct_perp_unknown), y = pct_perp_unknown)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Share of incidents with an unidentified perpetrator, by borough",
+       x = NULL, y = "Share unknown") +
+  theme_minimal()
+```
+
+# What: Fatal vs. Non-Fatal Shootings
+
+The helper below computes and plots the fatal/non-fatal split for any grouping variable, so the three "murderous vs. non-murderous by X" questions can share one implementation instead of three near-identical blocks of code.
+
+```{r fatality-helper, echo = TRUE}
+plot_fatality_rate <- function(data, group_var, top_n = Inf, title) {
+  group_var <- enquo(group_var)
+
+  summary_tbl <- data |>
+    filter(!is.na(!!group_var)) |>
+    count(!!group_var, STATISTICAL_MURDER_FLAG) |>
+    group_by(!!group_var) |>
+    mutate(pct = n / sum(n), total = sum(n)) |>
+    ungroup()
+
+  if (is.finite(top_n)) {
+    keep_levels <- summary_tbl |>
+      distinct(!!group_var, total) |>
+      slice_max(total, n = top_n) |>
+      pull(!!group_var)
+    summary_tbl <- summary_tbl |> filter(!!group_var %in% keep_levels)
+  }
+
+  summary_tbl |>
+    ggplot(aes(x = fct_reorder(!!group_var, total), y = pct, fill = STATISTICAL_MURDER_FLAG)) +
+    geom_col() +
+    coord_flip() +
+    scale_y_continuous(labels = percent) +
+    labs(title = title, x = NULL, y = "Share of shootings", fill = "Outcome") +
+    theme_minimal()
+}
+```
+
+## By victim age group
+
+```{r fatality-by-age}
+plot_fatality_rate(nyc_data, VIC_AGE_GROUP, title = "Fatality rate by victim age group")
+```
+
+## By location type
+
+```{r fatality-by-location}
+plot_fatality_rate(nyc_data, LOCATION_DESC, top_n = 10,
+                    title = "Fatality rate by location type (top 10 by incident volume)")
+```
+
+## By borough
+
+```{r fatality-by-boro}
+plot_fatality_rate(nyc_data, BORO, title = "Fatality rate by borough")
+```
+
+## Fatal vs. non-fatal shootings over time
+
+```{r lethal-timeseries}
+nyc_data |>
+  count(OCCUR_YEAR, STATISTICAL_MURDER_FLAG) |>
+  ggplot(aes(x = OCCUR_YEAR, y = n, color = STATISTICAL_MURDER_FLAG)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  labs(title = "Fatal vs. non-fatal shootings over time",
+       x = "Year", y = "Incidents", color = "Outcome") +
+  theme_minimal()
+```
+
+# When and Where
+
+## Is time of day related to severity?
+
+```{r time-of-day-severity}
+ggplot(nyc_data, aes(x = OCCUR_HOUR, color = STATISTICAL_MURDER_FLAG, fill = STATISTICAL_MURDER_FLAG)) +
+  geom_density(alpha = 0.25, linewidth = 0.8) +
+  scale_x_continuous(breaks = seq(0, 24, 4)) +
+  labs(title = "Time-of-day distribution: fatal vs. non-fatal shootings",
+       x = "Hour of day", y = "Density", color = "Outcome", fill = "Outcome") +
+  theme_minimal()
+```
+
+Shootings cluster heavily in the late evening/overnight hours regardless of outcome; there is no strong shift in *when* a shooting happens between fatal and non-fatal incidents, suggesting time of day is not itself a major driver of lethality.
+
+## Victims by age group over time
+
+```{r vic-age-over-time}
+nyc_data |>
+  count(OCCUR_YEAR, VIC_AGE_GROUP) |>
+  ggplot(aes(x = OCCUR_YEAR, y = n, color = VIC_AGE_GROUP)) +
+  geom_line(linewidth = 0.9) +
+  labs(title = "Victims by age group over time", x = "Year", y = "Number of victims",
+       color = "Victim age group") +
+  theme_minimal()
+```
+
+## Victim demographic composition over time
+
+```{r demographics-over-time, fig.height = 7}
+demo_over_time <- bind_rows(
+  nyc_data |> mutate(level = as.character(VIC_RACE)) |>
+    count(OCCUR_YEAR, level) |> mutate(dimension = "Victim race"),
+  nyc_data |> mutate(level = as.character(VIC_AGE_GROUP)) |>
+    count(OCCUR_YEAR, level) |> mutate(dimension = "Victim age group"),
+  nyc_data |> mutate(level = as.character(VIC_SEX)) |>
+    count(OCCUR_YEAR, level) |> mutate(dimension = "Victim sex")
+)
+
+ggplot(demo_over_time, aes(x = OCCUR_YEAR, y = n, fill = level)) +
+  geom_col(position = "fill") +
+  facet_wrap(~dimension, ncol = 1) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Victim demographic composition over time",
+       x = "Year", y = "Share of shootings", fill = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Map of shooting incidents
+
+Shootings are plotted at their (borough-imputed where missing) coordinates over NYC borough boundaries, colored by year and shaped by outcome.
+
+```{r nyc-map, cache = TRUE}
+nyc_boroughs <- counties(state = "NY", cb = TRUE) |>
+  filter(NAME %in% c("New York", "Kings", "Queens", "Bronx", "Richmond"))
+
+ggplot() +
+  geom_sf(data = nyc_boroughs, fill = "grey95", color = "grey50") +
+  geom_point(
+    data = nyc_data,
+    aes(x = Longitude, y = Latitude, color = OCCUR_YEAR, shape = STATISTICAL_MURDER_FLAG),
+    alpha = 0.35, size = 0.8
+  ) +
+  scale_color_viridis_c(name = "Year") +
+  scale_shape_manual(values = c("Non-Fatal" = 16, "Fatal" = 4), name = "Outcome") +
+  coord_sf() +
+  theme_minimal() +
+  labs(title = "Shooting incidents across New York City, 2006–2024", x = NULL, y = NULL)
+```
+
+# Statistical Model: Predictors of a Fatal Outcome
+
+The charts above look at one factor at a time. A logistic regression is useful — what is associated with a shooting being fatal rather than non-fatal — while adjusting for victim age group, victim sex, borough, and hour of day simultaneously. Incidents with an unknown victim age group are excluded so every model term is estimated consistently.
+
+```{r fit-model, echo = TRUE}
+model_data <- nyc_data |>
+  filter(VIC_AGE_GROUP != "UNKNOWN") |>
+  mutate(
+    VIC_AGE_GROUP = relevel(fct_drop(VIC_AGE_GROUP), ref = "18-24"),
+    BORO = relevel(BORO, ref = "BRONX")
+  )
+
+fatality_model <- glm(
+  STATISTICAL_MURDER_FLAG ~ VIC_AGE_GROUP + VIC_SEX + BORO + OCCUR_HOUR,
+  data = model_data,
+  family = binomial(link = "logit")
+)
+
+summary(fatality_model)
+```
+
+```{r model-table, echo = TRUE}
+model_coefs <- summary(fatality_model)$coefficients |>
+  as.data.frame() |>
+  rownames_to_column("term") |>
+  rename(std_error = `Std. Error`, p_value = `Pr(>|z|)`) |>
+  mutate(
+    odds_ratio = exp(Estimate),
+    conf_low   = exp(Estimate - 1.96 * std_error),
+    conf_high  = exp(Estimate + 1.96 * std_error)
+  ) |>
+  select(term, odds_ratio, conf_low, conf_high, p_value)
+
+knitr::kable(
+  model_coefs, digits = 3,
+  caption = "Logistic regression odds ratios for a fatal outcome (reference: victim age 18-24, victim sex M, borough Bronx)"
+)
+```
+
+```{r model-plot}
+model_coefs |>
+  filter(term != "(Intercept)") |>
+  ggplot(aes(x = fct_reorder(term, odds_ratio), y = odds_ratio, ymin = conf_low, ymax = conf_high)) +
+  geom_pointrange() +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(title = "Odds ratios for a fatal outcome (95% CI, log scale)",
+       x = NULL, y = "Odds ratio") +
+  theme_minimal()
+```
+
+Victim age group is the strongest and most consistent predictor in the model: the odds of a fatal outcome rise with each older age bracket relative to the 18-24 reference group, doubling for victims 65 and older, while victims under 18 have lower odds than 18-24 year-olds. Victim sex is not a statistically significant predictor once age, borough, and hour are held constant. Borough differences are modest — Manhattan shows somewhat lower odds than the Bronx reference, but the other boroughs are not significantly different from it. 
+Hour of day has no discernible effect on the odds of fatality, consistent with the time-of-day density plot above showing no shift in *when* fatal versus non-fatal shootings occur. **As with all the analysis** in this document, these are *associations* in observational data, not causal effects — the model does not account for factors such as weapon type or the number of shots fired, or more importantly a measure of intent, which more directly/closely determine lethality.
+
+# Issues in Bias and Analysis of Bias
+
+This dataset has some structural biases. First, it only records shootings that were reported to and recorded by the NYPD, so any systematic under-policing or under-reporting in a given area or period is invisible here — the data measures *recorded* shooting activity, not the true underlying rate. A secondary analysis may even show that underreporting has a structural relationship with location. Second, as the "Unidentified perpetrators" chart above shows, the share of incidents with no identified perpetrator varies by borough; because all perpetrator-demographic findings (race, sex, age composition) are necessarily computed only over the subset of incidents with a known perpetrator, those findings should be read as conditional on an arrest or identification being made, not as a description of all shooting incidents. Equivalently, this shows the extent of unsolved or unobserved perpetration of crime. Third, roughly 100 records were missing coordinates and were imputed to their borough's mean location, which slightly overstates precision at the map's finest scale even though it does not bias borough-level comparisons. Finally, demographic categories (race, age group) are the categories NYPD chooses to record, which is itself a methodological choice that shapes what can and cannot be seen in this analysis.
+
+# Conclusion
+
+Across two decades of archived NYPD shooting incidents, a few patterns stand out consistently. Shootings are heavily concentrated among male perpetrators and male victims, are overwhelmingly intra-racial rather than inter-racial, and cluster in the late evening and overnight hours regardless of whether the outcome is fatal. Where the descriptive analysis and the logistic regression agree is on victim age: older victims face substantially higher odds of a fatal outcome than younger ones, while borough and hour of day matter comparatively little once other factors are held constant. Perpetrator identification is incomplete and varies by borough, which limits how far any perpetrator-demographic finding can be generalized to *all* shootings rather than just the identified subset.
+
+None of this analysis supports causal claims — the data is observational, the model omits obviously relevant factors like weapon type, and every pattern here is filtered through what NYPD chose to record and was able to determine about a given incident. Read as a description of what is in this specific, now-archived dataset, though, the findings are consistent and line up across the univariate charts and the multivariate model alike.
+
+# Session Information
+I acknowledge the use of AI (Claude Code) to help me check my syntactic constructions in building the code, to search for the correct voacbulary to implementing my intentions where I lacked the choice of right libraries, programming strategy, the need to write a function over the larger dataset, and to help me find the right verb when I needed it. I also used a search engine to help generate ideas for questions to be posed regarding policing work. I relied on the visualisation videos from module 1 to give inspiration to the questions and analysis. 
+A sample of this process is presented, where AI is used to critique my work and identify corrections. 
+
+"Cleaning — all your commented-to-do factor conversions are implemented in one clean_data chunk: STATISTICAL_MURDER_FLAG (logical → factor), PERP_AGE_GROUP/PERP_SEX/PERP_RACE/VIC_AGE_GROUP/VIC_RACE/VIC_SEX/LOCATION_DESC/BORO all become factors, with (null)/blank/NONE/NA/malformed values (I found stray entries like "1028", "2021" in the age-group columns) collapsed to UNKNOWN per your notes. JURISDICTION_CODE, Lon_Lat, X_COORD_CD, Y_COORD_CD are dropped; missing lat/long (97 rows) are imputed from the borough mean.
+
+Clutter removed — the triplicate map-loading (geojson + KML + commented KMZ + mapview) collapsed to one static sf/tigris map; the buggy/redundant duplicate-check lines and the default R Markdown template filler text are gone; the three "fatal vs. non-fatal by X" analyses share one helper function instead of copy-pasted code.
+
+All ~12 analytical todos implemented: perp→victim race sankey, race relationship heatmap, male-on-male shooting rate, fatality rate by age/location/borough, fatal-vs-nonfatal trend, time-of-day vs. severity, unknowns-by-borough (reporting bias), victim age over time, victim demographic composition over time, and the NYC map (color = year, shape = outcome)."
+
+For reproducibility, the R session used to render this document is recorded below.
+
+```{r session-info, echo = TRUE}
+sessionInfo()
+```
