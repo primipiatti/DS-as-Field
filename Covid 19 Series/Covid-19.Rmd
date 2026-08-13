@@ -1,0 +1,426 @@
+---
+title: "COVID-19 Data Analysis"
+author: "Primal Patel"
+date: "2026-08-12"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Introduction and Questions of Interest
+
+This report analyzes the Johns Hopkins University CSSE COVID-19 dataset, which
+tracks confirmed cases and deaths from January 22, 2020 through March 9, 2023,
+when JHU stopped collecting data. The data comes as four time series files in
+wide format: one row per location (country or province globally; county for the
+US) and one column per date, holding *cumulative* counts. A separate lookup
+table supplies populations, which we join in to enable per-capita comparisons.
+
+The analysis addresses three questions:
+
+1. How did cases and deaths evolve over time in the US, and what distinct waves
+   are visible?
+2. How does the US compare to other countries, and how much do outcomes vary
+   across US states, on a per-capita basis?
+3. Does a state's case rate predict its death rate? ie. If we know
+   how many infections a state had per capita, how well can we predict its
+   deaths per capita?
+
+**Required libraries:** `tidyverse` and `lubridate`.
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+```
+
+## Importing the Data
+
+The data comes from the Johns Hopkins CSSE COVID-19 repository on GitHub. We
+read in four time series files (global and US, cases and deaths) plus a lookup
+table containing population data. Reading directly from the URLs keeps the
+analysis fully reproducible.
+
+```{r import_data}
+url_in <- paste0("https://raw.githubusercontent.com/CSSEGISandData/",
+                 "COVID-19/master/csse_covid_19_data/",
+                 "csse_covid_19_time_series/")
+
+file_names <- c("time_series_covid19_confirmed_global.csv",
+                "time_series_covid19_deaths_global.csv",
+                "time_series_covid19_confirmed_US.csv",
+                "time_series_covid19_deaths_US.csv")
+
+urls <- str_c(url_in, file_names)
+
+global_cases <- read_csv(urls[1])
+global_deaths <- read_csv(urls[2])
+us_cases <- read_csv(urls[3])
+us_deaths <- read_csv(urls[4])
+
+uid_lookup_url <- paste0("https://raw.githubusercontent.com/CSSEGISandData/",
+                         "COVID-19/master/csse_covid_19_data/",
+                         "UID_ISO_FIPS_LookUp_Table.csv")
+uid <- read_csv(uid_lookup_url) %>%
+  select(-c(Lat, Long_, Combined_Key, code3, iso2, iso3, Admin2))
+```
+
+## Tidying and Transforming the Data
+
+The raw files are in wide format, with one column per date. We pivot each date
+column into rows, convert the dates from character to date objects, drop the
+latitude/longitude columns we will not use, and join cases with deaths. For the
+global data we also join in populations from the lookup table so per-capita
+comparisons are possible.
+
+```{r tidy_global}
+global_cases <- global_cases %>%
+  pivot_longer(cols = -c(`Province/State`, `Country/Region`, Lat, Long),
+               names_to = "date",
+               values_to = "cases") %>%
+  select(-c(Lat, Long))
+
+global_deaths <- global_deaths %>%
+  pivot_longer(cols = -c(`Province/State`, `Country/Region`, Lat, Long),
+               names_to = "date",
+               values_to = "deaths") %>%
+  select(-c(Lat, Long))
+
+global <- global_cases %>%
+  full_join(global_deaths) %>%
+  rename(Country_Region = `Country/Region`,
+         Province_State = `Province/State`) %>%
+  mutate(date = mdy(date)) %>%
+  filter(cases > 0) %>%
+  unite("Combined_Key",
+        c(Province_State, Country_Region),
+        sep = ", ",
+        na.rm = TRUE,
+        remove = FALSE) %>%
+  left_join(uid, by = c("Province_State", "Country_Region")) %>%
+  select(Province_State, Country_Region, date,
+         cases, deaths, Population, Combined_Key)
+
+summary(global)
+```
+
+```{r tidy_us}
+us_cases <- us_cases %>%
+  pivot_longer(cols = -(UID:Combined_Key),
+               names_to = "date",
+               values_to = "cases") %>%
+  select(Admin2:cases) %>%
+  mutate(date = mdy(date)) %>%
+  select(-c(Lat, Long_))
+
+us_deaths <- us_deaths %>%
+  pivot_longer(cols = -(UID:Population),
+               names_to = "date",
+               values_to = "deaths") %>%
+  select(Admin2:deaths) %>%
+  mutate(date = mdy(date)) %>%
+  select(-c(Lat, Long_))
+
+us <- us_cases %>%
+  full_join(us_deaths)
+
+summary(us)
+```
+
+Next we aggregate the US county-level data up to the state level and to the
+national level, and calculate deaths per million for per-capita comparison.
+
+```{r us_by_state}
+us_by_state <- us %>%
+  group_by(Province_State, Country_Region, date) %>%
+  summarize(cases = sum(cases), deaths = sum(deaths),
+            Population = sum(Population)) %>%
+  mutate(deaths_per_mill = deaths * 1000000 / Population) %>%
+  select(Province_State, Country_Region, date,
+         cases, deaths, deaths_per_mill, Population) %>%
+  ungroup()
+
+us_totals <- us_by_state %>%
+  group_by(Country_Region, date) %>%
+  summarize(cases = sum(cases), deaths = sum(deaths),
+            Population = sum(Population)) %>%
+  mutate(deaths_per_mill = deaths * 1000000 / Population) %>%
+  select(Country_Region, date,
+         cases, deaths, deaths_per_mill, Population) %>%
+  ungroup()
+
+tail(us_totals)
+```
+
+By the end of the dataset (March 9, 2023), the US had recorded roughly 103.8
+million cases and 1.12 million deaths, out of a global total of about 676.6
+million cases and 6.88 million deaths.
+
+## Visualizing the Data
+
+### Cumulative cases and deaths in the US
+
+```{r visualize_us_totals}
+us_totals %>%
+  filter(cases > 0) %>%
+  ggplot(aes(x = date, y = cases)) +
+  geom_line(aes(color = "cases")) +
+  geom_line(aes(y = deaths, color = "deaths")) +
+  scale_y_log10() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 90)) +
+  labs(title = "COVID-19 in the US: Cumulative Cases and Deaths",
+       y = "count (log scale)", x = NULL, color = NULL)
+```
+
+On the log scale, both curves rise rapidly in US Spring 2020 and then flatten.
+Cumulative counts, however, hide the wave structure of the pandemic, so we look
+at *new* cases instead. The coverage of why the wave-structure of the pandemic is important has an example here: <https://www.cell.com/heliyon/fulltext/S2405-8440(24)01121-6?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS2405844024011216%3Fshowall%3Dtrue>. The wave structure indicates both the evolution and expected progression of the virus. 
+
+### New cases: the wave structure of the pandemic
+
+Because cases and deaths are cumulative, we compute daily new counts with
+`lag()`, then smooth with a 7-day rolling average to remove the strong
+day-of-week reporting cycle (a bias listed below).
+
+```{r visualize_new_cases}
+us_totals <- us_totals %>%
+  mutate(new_cases = cases - lag(cases),
+         new_deaths = deaths - lag(deaths))
+
+us_totals <- us_totals %>%
+  mutate(new_cases_7day = stats::filter(new_cases, rep(1/7, 7), sides = 1),
+         new_deaths_7day = stats::filter(new_deaths, rep(1/7, 7), sides = 1))
+
+us_totals %>%
+  filter(!is.na(new_cases_7day)) %>%
+  ggplot(aes(x = date, y = as.numeric(new_cases_7day))) +
+  geom_line(color = "steelblue") +
+  theme(legend.position = "bottom") +
+  labs(title = "US Daily New Cases (7-day average)",
+       y = "new cases per day", x = NULL)
+
+us_totals %>%
+  filter(!is.na(new_deaths_7day)) %>%
+  ggplot(aes(x = date, y = as.numeric(new_deaths_7day))) +
+  geom_line(color = "firebrick") +
+  labs(title = "US Daily New Deaths (7-day average)",
+       y = "new deaths per day", x = NULL)
+```
+
+Several distinct waves are visible: spring 2020, summer 2020, the large winter
+2020-21 wave, the Delta wave in late summer 2021, and the enormous Omicron
+spike, which peaked at roughly 807,000 new cases per day in mid-January 2022.
+Notably, the deaths curve does **not** mirror the cases curve: daily deaths
+peaked at about 3,400 per day in January 2021, a year *before* the case peak.
+The Omicron wave produced far more cases but proportionally fewer deaths,
+consistent with vaccination, prior immunity, and a less lethal variant.
+
+### Case fatality ratio over time
+
+We can separate the wave-structure and fatality by looking at the cumulative case fatality ratio (CFR),
+deaths divided by cases. See: <https://www.britannica.com/science/case-fatality-rate>
+
+```{r cfr}
+us_totals %>%
+  filter(cases > 1000) %>%
+  mutate(cfr = deaths / cases) %>%
+  ggplot(aes(x = date, y = cfr)) +
+  geom_line(color = "darkred") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "US Cumulative Case Fatality Ratio",
+       y = "deaths / cases", x = NULL)
+```
+
+The cumulative CFR fell from about 1.7% at the end of 2020 to about 1.1% by the
+end of the dataset. The early figure is inflated by limited testing (many mild
+cases were never counted), and the later decline reflects vaccines, better
+treatment, and the milder Omicron variant.
+
+### How does the US compare globally?
+
+Using the tidied global data (with populations joined in), we compute each
+country's cumulative deaths per thousand residents and compare the US against a
+set of peer countries, restricting to countries with over one million people so
+small-population outliers don't dominate.
+
+```{r global_comparison}
+country_totals <- global %>%
+  group_by(Country_Region) %>%
+  filter(date == max(date)) %>%
+  summarize(cases = sum(cases), deaths = sum(deaths),
+            Population = sum(Population, na.rm = TRUE)) %>%
+  filter(Population > 1000000) %>%
+  mutate(deaths_per_thou = 1000 * deaths / Population,
+         cases_per_thou = 1000 * cases / Population)
+
+comparison_countries <- c("US", "United Kingdom", "Italy", "France",
+                          "Germany", "Canada", "Japan", "Korea, South",
+                          "Mexico", "Brazil", "India", "Peru",
+                          "Australia", "Sweden")
+
+country_totals %>%
+  filter(Country_Region %in% comparison_countries) %>%
+  ggplot(aes(x = reorder(Country_Region, deaths_per_thou),
+             y = deaths_per_thou,
+             fill = Country_Region == "US")) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("grey60", "firebrick")) +
+  coord_flip() +
+  labs(title = "COVID-19 Deaths per Thousand: US vs. Peer Countries",
+       x = NULL, y = "deaths per thousand residents")
+
+country_totals %>%
+  slice_max(deaths_per_thou, n = 10) %>%
+  select(Country_Region, deaths_per_thou, cases_per_thou)
+```
+
+At about 3.4 deaths per thousand, the US fared worse than nearly every wealthy
+peer — the UK, Italy, and France sit near or below 3.2, Germany at 2.0, Canada
+at 1.4, and Japan and South Korea below 0.7 — and ranks roughly 12th worst
+among the 157 countries with over a million people, in the company of Peru
+(6.7, the world's worst) and the hardest-hit countries of Eastern Europe. This
+comparison must be read cautiously: reported deaths dramatically undercount
+true mortality in countries with weaker reporting fidelity, so the honest conclusion is
+that the US did poorly *relative to countries with comparable reporting
+systems*, not that it did worse than most of the world.
+
+### Which states fared best and worst?
+
+```{r state_extremes}
+us_state_totals <- us_by_state %>%
+  group_by(Province_State) %>%
+  summarize(deaths = max(deaths), cases = max(cases),
+            population = max(Population),
+            cases_per_thou = 1000 * cases / population,
+            deaths_per_thou = 1000 * deaths / population) %>%
+  filter(cases > 0, population > 0)
+
+us_state_totals %>%
+  slice_max(deaths_per_thou, n = 10) %>%
+  select(Province_State, deaths_per_thou, cases_per_thou)
+
+us_state_totals %>%
+  slice_min(deaths_per_thou, n = 10) %>%
+  select(Province_State, deaths_per_thou, cases_per_thou)
+```
+
+Death rates vary by roughly a factor of three among the 50 states: Arizona,
+Oklahoma, and Mississippi all exceeded 4.4 deaths per thousand residents, while
+Hawaii and Vermont stayed below 1.5. The national
+average was about 3.4 deaths per thousand.
+
+## Modeling the Data
+
+Does knowing a state's case rate let us predict its death rate? We fit a simple
+linear model of deaths per thousand as a function of cases per thousand across
+the states and territories.
+
+```{r model}
+mod <- lm(deaths_per_thou ~ cases_per_thou, data = us_state_totals)
+summary(mod)
+
+us_state_totals <- us_state_totals %>%
+  mutate(pred = predict(mod))
+
+us_state_totals %>%
+  ggplot() +
+  geom_point(aes(x = cases_per_thou, y = deaths_per_thou),
+             color = "blue") +
+  geom_line(aes(x = cases_per_thou, y = pred), color = "red") +
+  labs(title = "State Deaths per Thousand vs. Cases per Thousand",
+       subtitle = "Blue = actual, red = linear model prediction",
+       x = "cases per thousand", y = "deaths per thousand")
+```
+
+The relationship is positive and statistically significant, but weak: the model
+explains only about 31% of the variance (R-squared of roughly 0.31). Case rates
+alone are a poor predictor of death rates. States far above the line (more
+deaths than their case count predicts) and far below it (fewer) point to other
+drivers worth investigating: age structure, vaccination rates, hospital
+capacity, testing intensity, and the timing of when each state was hit — states hit hard in spring
+2020 faced the virus before treatments and vaccines existed.
+
+```{r model_residuals}
+us_state_totals %>%
+  mutate(resid = deaths_per_thou - pred) %>%
+  slice_max(abs(resid), n = 6) %>%
+  select(Province_State, cases_per_thou, deaths_per_thou, pred, resid)
+```
+
+## Potential Sources of Bias
+
+Several sources of bias should temper the conclusions:
+
+**Measurement bias in case counts.** Confirmed cases depend on testing.
+Testing was scarce in early 2020 and changed toward the use of home antigen tests
+(rarely reported) in 2022, so case undercounting varies over time and by state.
+This directly affects both the CFR analysis and the regression: some of the
+state-to-state variation in "cases per thousand" is variation in testing, not
+in infection.
+
+**Measurement bias in death counts.** States differed in how they attributed
+deaths to COVID-19 (deaths *with* versus *from* COVID), and death
+certificate practices changed over the pandemic.
+
+**Reporting artifacts.** The raw data contain day-of-week cycles and
+occasional bulk corrections (including negative "new case" days when
+jurisdictions revised totals). The 7-day average mitigates but does not
+eliminate this.
+
+**International comparability.** Countries differ enormously in testing
+capacity, death registration systems, and political incentives to report
+accurately. Cross-country comparisons of *reported* rates are only meaningful
+among countries with similar surveillance quality, which is why the global
+comparison above is framed around wealthy peer countries.
+
+**State model** The state-level regression cannot be interpreted at
+the individual level; it also treats each state as one point, ignoring huge
+within-state variation between counties.
+
+**Personal bias.** I came to this analysis expecting vaccination-era waves to
+be less deadly, which is a conclusion the data supports, but I have tried to
+mitigate confirmation bias by reporting the model's weak fit honestly and by
+listing alternative explanations (testing intensity, age structure, timing)
+rather than attributing state differences to any single cause.
+
+## Conclusion
+
+The JHU data show a pandemic that arrived in waves, with the link between
+infections and deaths weakening dramatically over time: the January 2022
+Omicron wave produced the most cases by far, yet daily deaths peaked a full
+year earlier, and the cumulative CFR fell from about 1.7% to 1.1%. On a
+per-capita basis the US recorded more deaths than nearly all of its wealthy
+peers, though cross-country comparisons are limited by reporting differences.
+Outcomes
+across states varied threefold on a per-capita basis, and a state's case rate
+explains only about a third of the variance in its death rate — meaning most of
+what determined how deadly the pandemic was in a given state lies in factors
+beyond raw infection counts. A natural follow-up would be to join in state-level
+vaccination, age, and hospital-capacity data to model those residuals directly.
+
+I acknowledge the use of AI (Claude Code) to help me check my syntactic constructions in building the code, to search for the correct voacbulary to implementing my intentions where I lacked the choice of right libraries, programming strategy, the need to write a function over the larger dataset, and to help me find the right verb when I needed it. I also used a search engine to help generate ideas for questions to be posed regarding policing work. I relied on the visualisation videos from module 1 to give inspiration to the questions and analysis. 
+
+Sample:
+Thought process
+Thought process
+All good questions — let me audit the document against each. The honest answer: six of seven are solidly covered, but the global-vs-US comparison is the weak spot. We import and tidy the global data but only cite world totals in prose — we never actually compare rates. Let me verify numbers for a proper comparison and fix that.
+
+"
+]
+Rubric audit, item by item:
+
+Global vs US rates — this was the one gap. We imported global data but only cited totals in prose. Now fixed: a new "How does the US compare globally?" section computes deaths per thousand by country, plots the US against 13 peer countries, and tables the 10 worst (population > 1M). Verified numbers: US ~3.4/thousand, roughly 12th worst of 157 countries — behind Peru (6.7) and Eastern Europe, far worse than Germany (2.0), Canada (1.4), Japan/Korea (<0.7).
+Stated purpose — yes, "Introduction and Questions of Interest" poses three explicit questions (question 2 now includes the global comparison).
+Data description — strengthened: the intro now specifies the source, date range, wide format (one row per location, one cumulative-count column per date, county-level for US), and the population lookup table.
+Model — yes, lm(deaths_per_thou ~ cases_per_thou) across states with prediction plot, R² discussion, and residual table.
+Personal bias — yes you have an explicit paragraph on prior expectation and mitigation.
+Reporting/other biases — yes: testing-dependent case counts, death attribution differences, day-of-week/bulk-correction artifacts, ecological fallacy, and a new international-comparability paragraph (why we compare only against similar-surveillance peers — e.g., India's reported 0.4/thousand vs excess-mortality estimates).
+sessionInfo() — yes, final chunk."
+
+```{r session_info}
+sessionInfo()
+```
